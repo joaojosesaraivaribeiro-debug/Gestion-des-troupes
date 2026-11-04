@@ -1,0 +1,253 @@
+// ==UserScript==
+// @name         Grepolis - Troop Exporter V1.12.0
+// @namespace    grepolis-export-troops
+// @version      1.12.0
+// @description  Exports troop counts from all cities to Excel or CSV. Requires an active Premium Administrator (Curator).
+// @match        https://*.grepolis.com/game/*
+// @require      https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js
+// @grant        none
+// ==/UserScript== 
+
+(function () {
+'use strict'; 
+
+const VERSION = '1.12.0';
+
+// ==================================================
+// UNIT TRANSLATIONS (EN)
+// ==================================================
+const UNIT_NAMES = {
+sword: 'Swordsmen',
+slinger: 'Slingers',
+archer: 'Archers',
+hoplite: 'Hoplites',
+rider: 'Riders',
+chariot: 'Chariots',
+catapult: 'Catapults',
+militia: 'Militia',
+calydonian_boar: 'Calydonian Boars',
+centaur: 'Centaurs',
+cerberus: 'Cerberus',
+fury: 'Furies',
+godsent: 'Godsent',
+griffin: 'Griffins',
+harpy: 'Harpies',
+manticore: 'Manticores',
+medusa: 'Medusas',
+minotaur: 'Minotaurs',
+pegasus: 'Pegasi',
+zyklop: 'Cyclopes',
+spartan: 'Spartoi',
+ladon: 'Ladon',
+siren: 'Sirens',
+bireme: 'Biremes',
+attack_ship: 'Light Ships',
+trireme: 'Triremes',
+sea_monster: 'Hydras',
+demolition_ship: 'Fire Ships',
+small_transporter: 'Fast Transport Boats',
+big_transporter: 'Slow Transport Boats',
+colonize_ship: 'Colony Ships'
+};
+
+// ==================================================
+// UNIT CATEGORIES FOR SPECIALITY CALCULATION
+// ==================================================
+const LAND_DEFENSE = ['archer', 'sword', 'calydonian_boar', 'centaur', 'cerberus', 'pegasus'];
+const LAND_ATTACK = ['catapult', 'rider', 'slinger', 'fury', 'griffin', 'harpy', 'manticore', 'spartan', 'ladon'];
+const LAND_MIXED = ['chariot', 'zyklop', 'godsent', 'hoplite', 'medusa', 'minotaur'];
+const NAVAL_DEFENSE = ['bireme'];
+const NAVAL_ATTACK = ['attack_ship'];
+const NAVAL_MIXED = ['trireme', 'sea_monster', 'siren'];
+
+// ==================================================
+// ROW VISUAL COLORS
+// ==================================================
+const SPECIALITY_COLORS = {
+'Conquest': 'F4CCCC',
+'Land Defense': 'D9EAD3',
+'Naval Defense': 'D9EAD3',
+'Land and Naval Defense': 'B6D7A8',
+'Land Attack': 'FCE5CD',
+'Naval Attack': 'FCE5CD',
+'Land and Naval Attack': 'F9CB9C',
+'Land Defense / Naval Attack': 'FFF2CC',
+'Land Attack / Naval Defense': 'FFF2CC',
+'No Speciality': 'D9D9D9'
+};
+
+// ==================================================
+// PREMIUM ADVISOR SECURITY CHECK
+// ==================================================
+function isPremiumActive() {
+const gameWindow = window;
+if (gameWindow.GameDataPremium && typeof gameWindow.GameDataPremium.isAdvisorActivated === 'function') {
+return gameWindow.GameDataPremium.isAdvisorActivated('curator');
+}
+return false;
+}
+
+function parseNumber(value) {
+const n = Number(value);
+return Number.isFinite(n) ? n : 0;
+}
+
+function mergeTroops(obj1, obj2) {
+const result = {};
+[obj1, obj2].forEach(obj => {
+if (!obj || typeof obj !== 'object') return;
+Object.entries(obj).forEach(([unit, quantity]) => {
+result[unit] = (result[unit] || 0) + parseNumber(quantity);
+});
+});
+return result;
+}
+
+function getTownTroops(town) {
+let inside = {};
+let outside = {};
+try { if (typeof town.units === 'function') inside = town.units() || {}; } catch (e) { console.warn(e); }
+try { if (typeof town.unitsOuter === 'function') outside = town.unitsOuter() || {}; } catch (e) { console.warn(e); }
+return mergeTroops(inside, outside);
+}
+
+function countGroup(troops, unitList) {
+return unitList.reduce((total, unit) => total + parseNumber(troops[unit]), 0);
+}
+
+function classifyGroup(troops, defenseList, attackList, mixedList) {
+const totalDef = countGroup(troops, defenseList);
+const totalAtk = countGroup(troops, attackList);
+const totalMix = countGroup(troops, mixedList);
+if (totalDef === 0 && totalAtk === 0) {
+    return { speciality: 'No Speciality', defense: 0, attack: 0 };
+}
+if (totalAtk > totalDef) {
+    return { speciality: 'Attack', attack: totalAtk + totalMix, defense: totalDef };
+}
+if (totalDef > totalAtk) {
+    return { speciality: 'Defense', defense: totalDef + totalMix, attack: totalAtk };
+}
+return { speciality: 'No Speciality', defense: totalDef, attack: totalAtk };
+
+}
+
+function classifyTown(troops) {
+if (parseNumber(troops.colonize_ship) > 0) {
+return 'Conquest';
+}
+const land = classifyGroup(troops, LAND_DEFENSE, LAND_ATTACK, LAND_MIXED);
+const naval = classifyGroup(troops, NAVAL_DEFENSE, NAVAL_ATTACK, NAVAL_MIXED);
+const landSpec = land.speciality;
+const navalSpec = naval.speciality;
+
+if (landSpec === 'No Speciality' && navalSpec === 'No Speciality') return 'No Speciality';
+if (landSpec !== 'No Speciality' && navalSpec === 'No Speciality') return landSpec + ' Land';
+if (landSpec === 'No Speciality' && navalSpec !== 'No Speciality') return navalSpec + ' Naval';
+if (landSpec === navalSpec) return landSpec + ' Land and Naval';
+return landSpec + ' Land / ' + navalSpec + ' Naval';
+
+}
+
+function collectData() {
+const gameWindow = window;
+if (!gameWindow.ITowns || !gameWindow.ITowns.towns) {
+throw new Error('ITowns.towns is not available.');
+}
+const towns = Object.values(gameWindow.ITowns.towns);
+if (!towns.length) throw new Error('No towns found.');
+const allUnits = new Set(Object.keys(UNIT_NAMES));
+const data = towns.map(town => {
+    const troops = getTownTroops(town);
+    Object.keys(troops).forEach(unit => allUnits.add(unit));
+    let name = 'Unknown City';
+    if (typeof town.getName === 'function') name = town.getName();
+    else if (town.name) name = town.name;
+
+    return {
+        townName: name,
+        speciality: classifyTown(troops),
+        troops: troops
+    };
+});
+
+const unitsArray = Array.from(allUnits).sort((a, b) => {
+    const nameA = UNIT_NAMES[a] || a;
+    const nameB = UNIT_NAMES[b] || b;
+    return nameA.localeCompare(nameB, 'en');
+});
+
+return { data, units: unitsArray };
+
+}
+
+function downloadFile(blob, filename) {
+const url = URL.createObjectURL(blob);
+const link = document.createElement('a');
+link.href = url;
+link.download = filename;
+document.body.appendChild(link);
+link.click();
+link.remove();
+setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function exportCSV(data, units) {
+const header = ['Speciality', 'City Name', ...units.map(u => UNIT_NAMES[u] || u)];
+const rows = [header];
+data.forEach(item => {
+    rows.push([
+        item.speciality,
+        item.townName,
+        ...units.map(u => parseNumber(item.troops[u]))
+    ]);
+});
+
+const totals = units.map(u => data.reduce((sum, item) => sum + parseNumber(item.troops[u]), 0));
+rows.push(['EMPIRE TOTAL', '', ...totals]);
+
+const csvContent = rows.map(row =>
+    row.map(val => '"' + String(val ?? '').replace(/"/g, '""') + '"').join(';')
+).join(\('\r\\)n');
+
+const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+downloadFile(blob, 'Grepolis_Troops_V' + VERSION + '.csv');
+
+}
+
+async function exportExcel(data, units) {
+const gameWindow = window;
+if (!gameWindow.ExcelJS) {
+throw new Error('ExcelJS library is not loaded.');
+}
+const workbook = new gameWindow.ExcelJS.Workbook();
+workbook.creator = 'Grepolis - Troop Exporter';
+workbook.created = new Date();
+const worksheet = workbook.addWorksheet('Troops');
+const header = ['Speciality', 'City Name', ...units.map(u => UNIT_NAMES[u] || u)];
+worksheet.addRow(header);
+
+const headerRow = worksheet.getRow(1);
+headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F4E78' } };
+headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+
+data.forEach(item => {
+    const rowData = [
+        item.speciality,
+        item.townName,
+        ...units.map(u => parseNumber(item.troops[u]))
+    ];
+    const excelRow = worksheet.addRow(rowData);
+    const color = SPECIALITY_COLORS[item.speciality] || 'FFFFFF';
+    excelRow.eachCell(cell => {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + color } };
+    });
+});
+
+const totals = units.map(u => data.reduce((sum, item) => sum + parseNumber(item.troops[u]), 0));
+const totalRow = worksheet.addRow(['EMPIRE TOTAL', '', ...totals]);
+totalRow.font = { bold: true };
+totalRow.eachCell(cell => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFD966' } };
+});
